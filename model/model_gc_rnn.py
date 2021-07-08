@@ -154,7 +154,7 @@ class Decoder(nn.ConvTranspose1d):
         return x
 
 
-class Dual_RNN_Block(nn.Module):
+class Grouo_Comm_Dual_RNN_Block(nn.Module):
     '''
        Implementation of the intra-RNN and the inter-RNN
        input:
@@ -169,23 +169,29 @@ class Dual_RNN_Block(nn.Module):
     '''
 
     def __init__(self, out_channels,
-                 hidden_channels, rnn_type='LSTM', norm='ln',
+                 hidden_channels, group_num, rnn_type='LSTM', norm='ln',
                  dropout=0, bidirectional=False, num_spks=2):
-        super(Dual_RNN_Block, self).__init__()
+        super(Grouo_Comm_Dual_RNN_Block, self).__init__()
         # RNN model
-        self.intra_rnn = getattr(nn, rnn_type)(
-            out_channels, hidden_channels, 1, batch_first=True, dropout=dropout, bidirectional=bidirectional)
-        self.inter_rnn = getattr(nn, rnn_type)(
-            out_channels, hidden_channels, 1, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        self.inter_group_rnn = getattr(nn, rnn_type)(
+            out_channels // group_num, hidden_channels // group_num, 1, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        self.intra_block_rnn = getattr(nn, rnn_type)(
+            out_channels // group_num, hidden_channels // group_num, 1, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        self.inter_block_rnn = getattr(nn, rnn_type)(
+            out_channels // group_num, hidden_channels // group_num, 1, batch_first=True, dropout=dropout, bidirectional=bidirectional)
         # Norm
-        self.intra_norm = select_norm(norm, out_channels, 4)
-        self.inter_norm = select_norm(norm, out_channels, 4)
+        self.inter_group_norm = select_norm(norm, out_channels, 4)
+        self.intra_block_norm = select_norm(norm, out_channels, 4)
+        self.inter_block_norm = select_norm(norm, out_channels, 4)
         # Linear
-        self.intra_linear = nn.Linear(
-            hidden_channels*2 if bidirectional else hidden_channels, out_channels)
-        self.inter_linear = nn.Linear(
-            hidden_channels*2 if bidirectional else hidden_channels, out_channels)
-        
+        self.inter_group_linear = nn.Linear(
+            hidden_channels*2 // group_num if bidirectional else hidden_channels // group_num, out_channels // group_num)
+        self.intra_block_linear = nn.Linear(
+            hidden_channels*2 // group_num if bidirectional else hidden_channels // group_num, out_channels // group_num)
+        self.inter_block_linear = nn.Linear(
+            hidden_channels*2 // group_num if bidirectional else hidden_channels // group_num, out_channels // group_num)
+
+        self.group_num = group_num        
 
     def forward(self, x):
         '''
@@ -193,37 +199,70 @@ class Dual_RNN_Block(nn.Module):
            out: [Spks, B, N, K, S]
         '''
         B, N, T, S = x.shape
-        # intra RNN
-        # [BS, 2T, N]
-        intra_rnn = x.permute(0, 3, 2, 1).contiguous().view(B*S, T, N)
-        # [BS, 2T, H]
-        intra_rnn, _ = self.intra_rnn(intra_rnn)
-        # [BS, 2T, N]
-        intra_rnn = self.intra_linear(intra_rnn.contiguous().view(B*S*T, -1)).view(B*S, T, -1)
-        # [B, S, 2T, N]
-        intra_rnn = intra_rnn.view(B, S, T, N)
+        K = self.group_num
+        M = N // K
+        assert M * K == N
+        x = x.contiguous().view(B, K, M, T, S)
+
+        # inter group RNN
+        # B, K, M, 2T, S => B  S  2T  K, M
+        # 0  1  2   3  4 => 0  4  3   1  2
+
+        # [B x S x 2T, K, M]
+        inter_grouo_rnn = x.permute(0, 4, 3, 1, 2).contiguous().view(B*S*T, K, M)
+        # [B x S x 2T, K, M']
+        inter_grouo_rnn, _ = self.inter_group_rnn(inter_grouo_rnn)
+        # [B, S, 2T, K, M]
+        inter_grouo_rnn = self.inter_group_linear(inter_grouo_rnn.contiguous().view(B*S*T*K, -1)).view(B, S, T, K * M)
+        # B, S, 2T, N => B, N, 2T, S
+        # 0  1  2   3 => 0  3   2  1
+        inter_grouo_rnn = inter_grouo_rnn.permute(0, 3, 2, 1)
+        # B, K, M, 2T, S
+        inter_grouo_rnn = self.inter_group_norm(inter_grouo_rnn).contiguous().view(B, K, M, T, S)
+        # B, K, M, 2T, S
+        inter_grouo_rnn = inter_grouo_rnn + x
+
+
+        # intra block RNN
+        # B, K, M, 2T, S => B, S, K, 2T, M => B x S x K, 2T, M
+        # 0  1  2   3  4 => 0  4  1   3  2 =>  
+        intra_rnn = inter_grouo_rnn.permute(0, 4, 1, 3, 2).contiguous().view(B*S*K, T, M)
+
+        # [B x S x K, 2T, M']
+        intra_rnn, _ = self.intra_block_rnn(intra_rnn)
+        # [B x S x K, 2T, M'] => [B, S, K, T, M]
+        intra_rnn = self.intra_block_linear(intra_rnn.contiguous().view(B*S*K*T, -1)).view(B, S, K, T, -1)
+        # B, S, K, 2T, M => B, K, M, 2T, S => B, N, 2T, S
+        # 0  1  2   3  4 => 0  2  4   3  1 
+
         # [B, N, 2T, S]
-        intra_rnn = intra_rnn.permute(0, 3, 2, 1).contiguous()
-        intra_rnn = self.intra_norm(intra_rnn)
+        intra_rnn = intra_rnn.permute(0, 2, 4, 3, 1).contiguous().view(B, N, T, S)
+        # B, K, M, 2T, S
+        intra_rnn = self.intra_block_norm(intra_rnn).contiguous().view(B, K, M, T, S)
         
         # [B, N, 2T, S]
-        intra_rnn = intra_rnn + x
+        intra_rnn = intra_rnn + inter_grouo_rnn
 
-        # inter RNN
+        
+        # inter block RNN
+        # B, K, M, 2T, S => B, 2T, K, S, M
+        # 0  1  2   3  4 => 0   3  1  4  2
+        # [B x 2T x K, S, M]
+        inter_rnn = intra_rnn.permute(0, 3, 1, 4, 2).contiguous().view(B*T*K, S, M)
+        # [B x 2T x K, S, M']
+        inter_rnn, _ = self.inter_block_rnn(inter_rnn)
+        # [B x 2T x K, S, M'] => [B x 2T x K, S, M] => B x 2T, K, S, M
+        inter_rnn = self.inter_block_linear(inter_rnn.contiguous().view(B*T*K*S, -1)).view(B, T, K, S, M)
+        # B, 2T, K, S, M ==> B, K, M, 2T, S ==> B, N, 2T, S
+        # 0   1  2  3  4 ==> 0  2  4   1  3
         # [B x 2T, S, N]
-        inter_rnn = intra_rnn.permute(0, 2, 3, 1).contiguous().view(B*T, S, N)
-        # [B x 2T, S, H]
-        inter_rnn, _ = self.inter_rnn(inter_rnn)
-        # [B x 2T, S, N]
-        inter_rnn = self.inter_linear(inter_rnn.contiguous().view(B*S*T, -1)).view(B*T, S, -1)
-        # [B x 2T, S, N]
-        inter_rnn = inter_rnn.view(B, T, S, N)
-        # [B, N, 2T, S]
-        inter_rnn = inter_rnn.permute(0, 3, 1, 2).contiguous()
-        inter_rnn = self.inter_norm(inter_rnn)
-        # [B, N, 2T, S]
+        inter_rnn = inter_rnn.permute(0, 2, 4, 1, 3).contiguous().view(B, N, T, S)
+
+        inter_rnn = self.inter_block_norm(inter_rnn).contiguous().view(B, K, M, T, S)
+        # [B, K, M, 2T, S]
         out = inter_rnn + intra_rnn
 
+        out = out.contiguous().view(B, N, T, S)
         return out
 
 
@@ -245,7 +284,8 @@ class Dual_Path_RNN(nn.Module):
     '''
 
     def __init__(self, in_channels, out_channels, hidden_channels,
-                 rnn_type='LSTM', norm='ln', dropout=0,
+                 group_num=4, 
+                 rnn_type='LSTM', norm='ln', dropout=0, 
                  bidirectional=False, num_layers=4, K=200, num_spks=2):
         super(Dual_Path_RNN, self).__init__()
         self.K = K
@@ -256,9 +296,9 @@ class Dual_Path_RNN(nn.Module):
 
         self.dual_rnn = nn.ModuleList([])
         for i in range(num_layers):
-            self.dual_rnn.append(Dual_RNN_Block(out_channels, hidden_channels,
-                                     rnn_type=rnn_type, norm=norm, dropout=dropout,
-                                     bidirectional=bidirectional))
+            self.dual_rnn.append(Grouo_Comm_Dual_RNN_Block(out_channels, hidden_channels, group_num=group_num,
+                                                           rnn_type=rnn_type, norm=norm, dropout=dropout,
+                                                           bidirectional=bidirectional))
 
         self.conv2d = nn.Conv2d(
             out_channels, out_channels*num_spks, kernel_size=1)
@@ -408,9 +448,9 @@ class Dual_RNN_model(nn.Module):
         return audio
 
 if __name__ == "__main__":
-    rnn = Dual_RNN_model(256, 64, 128,bidirectional=True, norm='ln', num_layers=6)
+    rnn = Dual_RNN_model(256, 64, 128,bidirectional=True, norm='ln', num_layers=6).cuda()
     #encoder = Encoder(16, 512)
-    x = torch.ones(1, 100)
+    x = torch.ones(1, 16000).cuda()
     out = rnn(x)
     print("{:.3f}".format(check_parameters(rnn)*1000000))
     print(rnn)
